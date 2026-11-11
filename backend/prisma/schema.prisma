@@ -1,0 +1,309 @@
+// Proxmox VE Management Portal — PostgreSQL schema (Prisma)
+generator client { provider = "prisma-client-js" }
+datasource db { provider = "postgresql"; url = env("DATABASE_URL") }
+
+enum Role { SUPER_ADMIN ADMIN RESELLER USER }
+enum UserStatus { ACTIVE SUSPENDED PENDING_VERIFICATION }
+enum VmType { QEMU LXC }
+enum VmStatus { RUNNING STOPPED SUSPENDED UNKNOWN DELETED }
+enum TaskStatus { QUEUED RUNNING SUCCESS FAILED }
+enum TicketStatus { OPEN IN_PROGRESS RESOLVED CLOSED }
+enum IpStatus { FREE ASSIGNED RESERVED }
+enum BackupMode { SNAPSHOT SUSPEND STOP }
+enum NotificationType { VM_CREATED VM_DELETED BACKUP_FAILED HIGH_USAGE TASK_FAILED SYSTEM }
+
+model User {
+  id String @id @default(cuid())
+  email String @unique
+  name String
+  passwordHash String
+  role Role @default(USER)
+  status UserStatus @default(PENDING_VERIFICATION)
+  emailVerifiedAt DateTime?
+  twoFactorEnabled Boolean @default(false)
+  twoFactorSecret String? // encrypted
+  backupCodes String[] @default([])
+  failedLoginCount Int @default(0)
+  lockedUntil DateTime?
+  lastLoginAt DateTime?
+  emailVerifyTokenHash String?
+  passwordResetTokenHash String?
+  passwordResetExpires DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  quota Quota?
+  sessions Session[]
+  apiKeys ApiKey[]
+  vms Vm[]
+  auditLogs AuditLog[]
+  notifications Notification[]
+  tickets Ticket[]
+  tasks Task[]
+  @@index([role, status])
+}
+model Quota {
+  id String @id @default(cuid())
+  userId String @unique
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  maxVms Int @default(3)
+  maxVCpu Int @default(8)
+  maxRamMb Int @default(16384)
+  maxDiskGb Int @default(200)
+  maxSnapshots Int @default(10)
+  maxBackups Int @default(10)
+  maxIps Int @default(3)
+  updatedAt DateTime @updatedAt
+}
+model Session {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash String
+  userAgent String?
+  ip String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([userId, revokedAt])
+}
+model LoginAttempt {
+  id String @id @default(cuid())
+  email String
+  ip String?
+  success Boolean
+  reason String?
+  createdAt DateTime @default(now())
+  @@index([email, createdAt])
+}
+model ApiKey {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name String
+  keyPrefix String
+  keyHash String @unique
+  scopes String[] @default([])
+  lastUsedAt DateTime?
+  expiresAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([userId])
+}
+model Cluster {
+  id String @id @default(cuid())
+  name String @unique
+  host String // hostname or IP, no scheme
+  port Int @default(8006)
+  // Proxmox API token: user@realm!tokenid  + secret (secret stored AES-256-GCM encrypted)
+  tokenId String
+  tokenSecretEnc String
+  verifyTls Boolean @default(false)
+  enabled Boolean @default(true)
+  lastSeenAt DateTime?
+  lastError String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  nodes Node[]
+  vms Vm[]
+  ipPools IpPool[]
+}
+model Node {
+  id String @id @default(cuid())
+  clusterId String
+  cluster Cluster @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+  name String // Proxmox node name e.g. pve1
+  status String @default("unknown")
+  cpuUsage Float?
+  maxCpu Int?
+  memUsed BigInt?
+  memTotal BigInt?
+  updatedAt DateTime @updatedAt
+  @@unique([clusterId, name])
+}
+model Plan {
+  id String @id @default(cuid())
+  name String @unique
+  description String?
+  vcpu Int
+  ramMb Int
+  diskGb Int
+  priceMonthly Float @default(0)
+  enabled Boolean @default(true)
+  createdAt DateTime @default(now())
+  vms Vm[]
+}
+model Vm {
+  id String @id @default(cuid())
+  ownerId String
+  owner User @relation(fields: [ownerId], references: [id])
+  clusterId String
+  cluster Cluster @relation(fields: [clusterId], references: [id])
+  planId String?
+  plan Plan? @relation(fields: [planId], references: [id])
+  node String
+  vmid Int
+  type VmType @default(QEMU)
+  name String
+  hostname String?
+  status VmStatus @default(STOPPED)
+  vcpu Int @default(1)
+  ramMb Int @default(1024)
+  diskGb Int @default(10)
+  storage String @default("local-lvm")
+  bridge String @default("vmbr0")
+  vlan Int?
+  ipAddress String?
+  template String?
+  description String?
+  tags String[] @default([])
+  deletedAt DateTime? // soft-delete; hard purge after retention window
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  snapshots Snapshot[]
+  backups Backup[]
+  tasks Task[]
+  firewallRules FirewallRule[]
+  ipAllocations IpAddress[]
+  @@unique([clusterId, vmid])
+  @@index([ownerId, status])
+  @@index([deletedAt])
+}
+model IpPool {
+  id String @id @default(cuid())
+  clusterId String?
+  cluster Cluster? @relation(fields: [clusterId], references: [id], onDelete: SetNull)
+  name String
+  bridge String @default("vmbr0")
+  vlan Int?
+  gateway String
+  netmask String @default("255.255.255.0")
+  dns String?
+  createdAt DateTime @default(now())
+  addresses IpAddress[]
+}
+model IpAddress {
+  id String @id @default(cuid())
+  poolId String
+  pool IpPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  ip String
+  status IpStatus @default(FREE)
+  vmId String?
+  vm Vm? @relation(fields: [vmId], references: [id], onDelete: SetNull)
+  @@unique([poolId, ip])
+  @@index([status])
+}
+model Snapshot {
+  id String @id @default(cuid())
+  vmId String
+  vm Vm @relation(fields: [vmId], references: [id], onDelete: Cascade)
+  name String
+  description String?
+  proxmoxCreatedAt DateTime?
+  createdAt DateTime @default(now())
+  @@unique([vmId, name])
+}
+model Backup {
+  id String @id @default(cuid())
+  vmId String
+  vm Vm @relation(fields: [vmId], references: [id], onDelete: Cascade)
+  volid String? // storage volume id returned by vzdump
+  storage String @default("local")
+  mode BackupMode @default(SNAPSHOT)
+  scheduleCron String?
+  sizeBytes BigInt?
+  createdAt DateTime @default(now())
+}
+model BackupSchedule {
+  id String @id @default(cuid())
+  vmId String
+  cron String
+  storage String @default("local")
+  mode BackupMode @default(SNAPSHOT)
+  retention Int @default(3)
+  enabled Boolean @default(true)
+  createdAt DateTime @default(now())
+  @@index([vmId])
+}
+model FirewallRule {
+  id String @id @default(cuid())
+  vmId String
+  vm Vm @relation(fields: [vmId], references: [id], onDelete: Cascade)
+  position Int @default(0)
+  action String @default("ACCEPT") // ACCEPT DROP REJECT
+  dir String @default("in") // in out
+  proto String?
+  dport String?
+  source String?
+  dest String?
+  enabled Boolean @default(true)
+  comment String?
+  createdAt DateTime @default(now())
+}
+model Task {
+  id String @id @default(cuid())
+  userId String?
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  vmId String?
+  vm Vm? @relation(fields: [vmId], references: [id], onDelete: SetNull)
+  clusterId String?
+  node String?
+  upid String?
+  action String // vm.create, vm.start, backup.create ...
+  status TaskStatus @default(QUEUED)
+  progress Int @default(0)
+  log String?
+  error String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  finishedAt DateTime?
+  @@index([userId, createdAt])
+  @@index([status])
+}
+model AuditLog {
+  id String @id @default(cuid())
+  actorId String?
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action String
+  entity String?
+  entityId String?
+  ip String?
+  userAgent String?
+  metadata Json?
+  createdAt DateTime @default(now())
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+}
+model Notification {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type NotificationType
+  title String
+  body String?
+  readAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([userId, readAt])
+}
+model Ticket {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject String
+  status TicketStatus @default(OPEN)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  messages TicketMessage[]
+}
+model TicketMessage {
+  id String @id @default(cuid())
+  ticketId String
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId String
+  body String
+  createdAt DateTime @default(now())
+}
+model Setting {
+  key String @id
+  value Json
+  updatedAt DateTime @updatedAt
+}
